@@ -23,14 +23,21 @@
  * 
  */
 
-bool open_db(TCHDB *hdb, TCXSTR *db_file, int64_t bnum, bool optimize) {
+TCHDB *hdb;
+TCRDB *tdb;
+TCXSTR *db_file, *tdb_host;
+int tdb_port;
+
+bool use_cabinet_lib;
+
+bool open_cabinet_db(int64_t bnum, bool optimize) {
 
     int ecode;
-    
+
     if (optimize) fprintf(stdout, "Opening database optimized for %d items\n", bnum);
 
     /* tune up the db*/
-    if (optimize && !tchdbtune(hdb, bnum, -1, -1, HDBTLARGE)) {        
+    if (optimize && !tchdbtune(hdb, bnum, -1, -1, HDBTLARGE)) {
         ecode = tchdbecode(hdb);
         fprintf(stdout, "Failed to tune up database, error: %s\n", tchdberrmsg(ecode));
         return false;
@@ -46,8 +53,36 @@ bool open_db(TCHDB *hdb, TCXSTR *db_file, int64_t bnum, bool optimize) {
     return true;
 }
 
-bool key_exists(TCHDB *hdb, const char *key) {
+bool open_tyrant_db() {
 
+    int ecode;
+
+
+    /* open the database */
+    if (!tcrdbopen(tdb, tcxstrptr(tdb_host), tdb_port)) {
+        ecode = tchdbecode(tdb);
+        fprintf(stdout, "Failed to open database, error: %s\n", tcrdberrmsg(ecode));
+        return false;
+    }
+
+    return true;
+
+}
+
+void close_db(){
+    if(use_cabinet_lib){ 
+        tchdbclose(hdb);
+        tchdbdel(hdb);
+    } else{ 
+        tcrdbclose(tdb);
+        tcrdbdel(tdb);
+    }
+}
+
+bool key_exists(const char *key) {
+
+    if (use_cabinet_lib) return tchdbvsiz2(hdb, key) > 0;
+    else return tcrdbvsiz2(tdb, key) > 0;
 
 }
 
@@ -70,7 +105,7 @@ char *get_file_name(char *path, size_t path_size) {
     return file_name;
 }
 
-int unpack_files(char *root_dir, TCHDB *hdb, bool verbose, bool test) {
+int unpack_files(char *root_dir, bool verbose, bool test) {
 
     char *key;
     void *value;
@@ -103,7 +138,7 @@ int unpack_files(char *root_dir, TCHDB *hdb, bool verbose, bool test) {
     return count;
 }
 
-int pack_file(char *file, TCHDB *hdb, TCXSTR *root_key, bool resume) {
+int pack_file(char *file, TCXSTR *root_key, bool resume) {
 
     struct stat st;
     int ecode;
@@ -120,7 +155,7 @@ int pack_file(char *file, TCHDB *hdb, TCXSTR *root_key, bool resume) {
 
     tcxstrcat2(key, file_name);
 
-    if (resume && tchdbvsiz2(hdb, tcxstrptr(key)) > 0) {
+    if (resume && key_exists(tcxstrptr(key))) {
         fprintf(stdout, "already exists");
         return;
     }
@@ -151,11 +186,20 @@ int pack_file(char *file, TCHDB *hdb, TCXSTR *root_key, bool resume) {
     }
 
     /* store records */
-    if (!tchdbput(hdb, tcxstrptr(key), tcxstrsize(key), fmap, st.st_size)) {
-        ecode = tchdbecode(hdb);
-        fprintf(stdout, "put error: %s", tchdberrmsg(ecode));
+    if (use_cabinet_lib) {
+        if (!tchdbput(hdb, tcxstrptr(key), tcxstrsize(key), fmap, st.st_size)) {
+            ecode = tchdbecode(hdb);
+            fprintf(stdout, "put error: %s", tchdberrmsg(ecode));
+        }
+    } else {
+        if (!tcrdbput(tdb, tcxstrptr(key), tcxstrsize(key), fmap, st.st_size)) {
+            ecode = tcrdbecode(tdb);
+            fprintf(stdout, "put error: %s", tcrdberrmsg(ecode));
+        }
+
+
     }
-    
+
     fprintf(stdout, "%d bytes", st.st_size);
 
     munmap(fmap, st.st_size);
@@ -164,8 +208,8 @@ int pack_file(char *file, TCHDB *hdb, TCXSTR *root_key, bool resume) {
 }
 
 int main(int argc, char **argv) {
-    TCHDB *hdb;
-    TCXSTR *pattern, *key_root, *db_file;
+
+    TCXSTR *pattern, *key_root;
     int ecode;
     bool verbose, test, create, extract, optimize, resume;
     int o;
@@ -174,16 +218,29 @@ int main(int argc, char **argv) {
     pattern = tcxstrnew();
     key_root = tcxstrnew();
     db_file = tcxstrnew();
+    tdb_host = tcxstrnew();
+
+    tdb_port = 0;
 
 
-    while (-1 != (o = getopt(argc, argv, "cxtvrof:p:k:"))) {
+    while (-1 != (o = getopt(argc, argv, "cxtvrof:p:k:H:P:"))) {
 
         switch (o) {
             case 'f':
+                use_cabinet_lib = true;
                 tcxstrcat2(db_file, optarg);
 
                 /* create the object */
                 hdb = tchdbnew();
+                break;
+            case 'H':
+                use_cabinet_lib = false;
+                tcxstrcat2(tdb_host, optarg);
+
+                tdb = tcrdbnew();
+                break;
+            case 'P':
+                tdb_port = strtol(optarg, NULL, 0);
                 break;
             case 'k':
                 tcxstrcat2(key_root, optarg);
@@ -226,7 +283,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (NULL == hdb) {
+    if ((use_cabinet_lib && NULL == hdb)
+            ||
+            (!use_cabinet_lib && NULL == tdb)) {
         fprintf(stdout, "No database specifed. Use -f dbfile.tch\n");
         return 1;
     }
@@ -241,7 +300,8 @@ int main(int argc, char **argv) {
         glob(tcxstrptr(pattern), GLOB_NOSORT, NULL, &gtree);
         size_t found = gtree.gl_pathc;
 
-        if (!open_db(hdb, db_file, (int64_t) found, optimize)) return 2;
+        if (use_cabinet_lib && !open_cabinet_db((int64_t) found, optimize)) return 2;
+        if (!use_cabinet_lib && !open_tyrant_db()) return 3;
 
         int i;
         for (i = 0; i < found; i++) {
@@ -250,30 +310,26 @@ int main(int argc, char **argv) {
 
             if (verbose || test) fprintf(stdout, "\n%d of %d - packing file: %s ...", i, found, fname);
 
-            if (!test) pack_file(fname, hdb, key_root, resume);
+            if (!test) pack_file(fname, key_root, resume);
         }
 
         fprintf(stdout, "Finished. Processed %d items\n", (int) found);
         globfree(&gtree);
     } else if (extract) {
-        if (!open_db(hdb, db_file, 0, false)) return 2;
+        if (!open_cabinet_db(0, false)) return 2;
 
         int count;
-        count = unpack_files(NULL, hdb, verbose, test);
+        count = unpack_files(NULL, verbose, test);
         fprintf(stdout, "Finished. Processed %d items\n", count);
     }
 
     /* close the database */
-    if (!tchdbclose(hdb)) {
-        ecode = tchdbecode(hdb);
-        fprintf(stdout, "close error: %s\n", tchdberrmsg(ecode));
-    }
+    close_db();
 
     /* delete the objects */
     tcxstrdel(pattern);
     tcxstrdel(key_root);
-    tchdbdel(hdb);
-
+    
     return 0;
 }
 
